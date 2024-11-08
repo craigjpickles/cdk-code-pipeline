@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
-import { CdkCodePipelineStack } from '../lib/cdk-code-pipeline-stack';
+import { CommonResourcesStack } from '../lib/common-resources-stack';
 
 const app = new cdk.App();
-new CdkCodePipelineStack(app, 'CdkCodePipelineStack', {
+new CommonResourcesStack(app, 'CommonResourcesStack', {
   /* If you don't specify 'env', this stack will be environment-agnostic.
    * Account/Region-dependent features and context lookups will not work,
    * but a single synthesized template can be deployed anywhere. */

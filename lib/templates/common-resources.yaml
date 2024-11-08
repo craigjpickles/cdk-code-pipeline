@@ -1,0 +1,326 @@
+  AWSTemplateFormatVersion: "2010-09-09"
+Description: Cross Account CodePipeline for Project
+Parameters:
+  CrossAccountPipelineRoleName:
+    Description: The name of the cross account pipeline role
+    Type: String
+  CrossAccountDeployerRoleName:
+    Description: The name of the cross account deployer role
+    Type: String
+  OrganisationId:
+    Description: The Organisation Id for permissions
+    Type: String
+
+Resources:
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Used by Assumed Roles in Dev/Test/UAT/Prod accounts to Encrypt/Decrypt code
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Allows admin of the key
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - "kms:Create*"
+              - "kms:Describe*"
+              - "kms:Enable*"
+              - "kms:List*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:ScheduleKeyDeletion"
+              - "kms:CancelKeyDeletion"
+            Resource: "*"
+          - Sid: Allow use of the key in Code Build projects
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt BuildProjectRole.Arn
+                - !GetAtt PipelineRole.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+          - Sid: Allow use of the key in accounts within the organisation
+            Effect: Allow
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Principal: "*"
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganisationId
+
+  KMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-CMKARN
+      TargetKeyId: !Ref KMSKey
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName:
+        "Fn::Transform":
+          Name: "String"
+          Parameters:
+            InputString: !Sub ${AWS::StackName}-codepipeline-artifacts
+            Operation: Lower
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  BuildProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+              AWS:
+                - !GetAtt PipelineRole.Arn
+            Action:
+              - sts:AssumeRole
+
+      Path: /
+
+  BuildProjectPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-codebuild-policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetBucketPolicy
+              - s3:GetObject
+              - s3:ListBucket
+
+            Resource:
+              - !Join ["", ["arn:aws:s3:::", !Ref S3Bucket, "/*"]]
+              - !Join ["", ["arn:aws:s3:::", !Ref S3Bucket]]
+          - Effect: Allow
+            Action:
+              - kms:*
+            Resource: !GetAtt KMSKey.Arn
+          - Effect: Allow
+            Action:
+              - codecommit:List*
+              - codecommit:Get*
+              - codecommit:GitPull
+              - codecommit:UploadArchive
+              - codecommit:CancelUploadArchive
+            Resource:
+              - "*"
+          - Effect: Allow
+            Action:
+              - codebuild:*
+            Resource:
+              - "*"
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+      Roles:
+        - !Ref BuildProjectRole
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-codepipeline-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+
+  PipelinePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-codepipeline-policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - codepipeline:*
+              - iam:ListRoles
+              - cloudformation:Describe*
+              - cloudFormation:List*
+              - codecommit:List*
+              - codecommit:Get*
+              - codecommit:GitPull
+              - codecommit:UploadArchive
+              - codecommit:CancelUploadArchive
+              - codebuild:BatchGetBuilds
+              - codebuild:StartBuild
+              - cloudformation:CreateStack
+              - cloudformation:DeleteStack
+              - cloudformation:DescribeStacks
+              - cloudformation:UpdateStack
+              - cloudformation:CreateChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:SetStackPolicy
+              - cloudformation:ValidateTemplate
+              - iam:PassRole
+              - s3:ListAllMyBuckets
+              - s3:GetBucketLocation
+              - sns:*
+            Resource:
+              - "*"
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: !GetAtt KMSKey.Arn
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetBucketPolicy
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Join ["", ["arn:aws:s3:::", !Ref S3Bucket, "/*"]]
+              - !Join ["", ["arn:aws:s3:::", !Ref S3Bucket]]
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource:
+              - !Sub arn:aws:iam::*:role/${CrossAccountPipelineRoleName}
+
+      Roles:
+        - !Ref PipelineRole
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:*
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:s3:::${S3Bucket}
+              - !Sub arn:aws:s3:::${S3Bucket}/*
+            Principal:
+              AWS:
+                - !GetAtt BuildProjectRole.Arn
+          - Action:
+              - s3:*
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:s3:::${S3Bucket}
+              - !Sub arn:aws:s3:::${S3Bucket}/*
+            Principal: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganisationId
+              ArnLike:
+                aws:PrincipalArn:
+                  - !Sub arn:aws:iam::*:role/${CrossAccountPipelineRoleName}
+                  - !Sub arn:aws:iam::*:role/${CrossAccountDeployerRoleName}
+
+  BuildProjectRoleARNParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/CodePipeline/CommonResources/BuildProjectRoleARN"
+      Type: String
+      Value: !GetAtt BuildProjectRole.Arn
+
+  PipelineRoleARNParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/CodePipeline/CommonResources/PipelineRoleARN"
+      Type: String
+      Value: !GetAtt PipelineRole.Arn
+
+  CMKARNParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/CodePipeline/CommonResources/CMKARN"
+      Type: String
+      Value: !GetAtt KMSKey.Arn
+
+  S3BucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/CodePipeline/CommonResources/S3Bucket"
+      Type: String
+      Value: !Ref S3Bucket
+
+  CrossAccountPipelineRoleNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/CodePipeline/CommonResources/CrossAccountPipelineRoleName"
+      Type: String
+      Value: !Ref CrossAccountPipelineRoleName
+
+  CrossAccountDeployerRoleNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/CodePipeline/CommonResources/CrossAccountDeployerRoleName"
+      Type: String
+      Value: !Ref CrossAccountDeployerRoleName
+
+Outputs:
+  BuildProjectRoleARN:
+    Value: !GetAtt BuildProjectRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-BuildProjectRoleArn
+  PipelineRoleARN:
+    Value: !GetAtt PipelineRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-PipelineRoleArn
+  CMKARN:
+    Value: !GetAtt KMSKey.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CMKARN
+  S3Bucket:
+    Value: !Ref S3Bucket
+    Export:
+      Name: !Sub ${AWS::StackName}-S3Bucket
+  CrossAccountPipelineRoleName:
+    Value: !Ref CrossAccountPipelineRoleName
+    Export:
+      Name: !Sub ${AWS::StackName}-CrossAccountPipelineRoleName
+  CrossAccountDeployerRoleName:
+    Value: !Ref CrossAccountDeployerRoleName
+    Export:
+      Name: !Sub ${AWS::StackName}-CrossAccountDeployerRoleName
