@@ -226,6 +226,25 @@ export class CommonResourcesStack extends cdk.Stack {
           }),
           new iam.PolicyStatement({
             effect: iam.Effect.ALLOW,
+            actions: [
+              'cloudformation:Describe*',
+              'cloudformation:List*',
+              'cloudformation:*ChangeSet',
+            ],
+            resources: ['*'],
+          }),
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: ['iam:PassRole'],
+            resources: ['*'],
+          }),
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: ['codestar-connections:*'],
+            resources: ['*'],
+          }),
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
             actions: ['codebuild:*'],
             resources: ['*'],
           }),
@@ -237,6 +256,13 @@ export class CommonResourcesStack extends cdk.Stack {
               'logs:PutLogEvents',
             ],
             resources: ['arn:aws:logs:*:*:*'],
+          }),
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: ['sts:AssumeRole'],
+            resources: [
+              cdk.Fn.sub('arn:aws:iam::*:role/${CrossAccountDeployerRoleName}'),
+            ],
           }),
         ],
       }),

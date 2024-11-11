@@ -1,0 +1,244 @@
+# This template creates resources needed by a cloudformation cross-account code pipeline
+# Its source is managed by landgate-shared-services (110946370556)here https://ap-southeast-2.console.aws.amazon.com/codesuite/codecommit/repositories/SlipCrossAccountPipeline
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Cross Account CodePipeline for Project
+Parameters:
+  StackName:
+    Description: lowercase name of stack
+    Type: String
+  RepositoryName:
+    Description: Name of the Project
+    Type: String
+  BranchName:
+    Description: Name of the Project
+    Type: String
+    Default: master
+  BranchTemplateName:
+    Description: Name of the CF template
+    Type: String
+    Default: template.yaml
+  DependencyFolders:
+    Description: csv list of folders in the source repo to be copied to the dependency bucket
+    Type: String
+    Default: ""
+  NonProductionAccount:
+    Description: AWS AccountNumber for Non-Production
+    Type: Number
+  ProductionAccount:
+    Description: AWS AccountNumber for Production
+    Type: Number
+
+Resources:
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref AWS::StackName
+      Description: !Ref AWS::StackName
+      EncryptionKey: "{{resolve:ssm:/CodePipeline/CommonResources/CMKARN:2:1713342645825}}"
+      ServiceRole: "{{resolve:ssm:/CodePipeline/CommonResources/BuildProjectRoleARN:1:1712818863440}}"
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        EnvironmentVariables:
+          - Name: S3Bucket
+            Value: "{{resolve:ssm:/CodePipeline/CommonResources/S3Bucket:1:1712818848842}}"
+          - Name: S3BuildsPrefix
+            Value: !Sub "${StackName}/builds"
+          - Name: TemplateName
+            Value: !Ref BranchTemplateName
+          - Name: KMSKey
+            Value: "{{resolve:ssm:/CodePipeline/CommonResources/CMKARN:2:1713342645825}}"
+          - Name: DependencyFolders
+            Value: !Ref DependencyFolders
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 10
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: "{{resolve:ssm:/CodePipeline/CommonResources/PipelineRoleARN:1:1712818843661}}"
+      Name: !Ref AWS::StackName
+      PipelineType: V2
+      RestartExecutionOnUpdate: false
+      ExecutionMode: QUEUED
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: App
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: "1"
+                Provider: CodeCommit
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: !Ref BranchName
+              OutputArtifacts:
+                - Name: SCCheckoutArtifact
+              RunOrder: 1
+              RoleArn: "{{resolve:ssm:/CodePipeline/CommonResources/BuildProjectRoleARN:1:1712818863440}}"
+
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: "1"
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref BuildProject
+              RunOrder: 1
+              InputArtifacts:
+                - Name: SCCheckoutArtifact
+              OutputArtifacts:
+                - Name: BuildOutput
+
+        - Name: DeployToDev
+          Actions:
+            - Name: CreateChangeSetDev
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: "1"
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: !Ref RepositoryName
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub ${StackName}-dev
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                TemplateConfiguration: BuildOutput::packaged-template-dev-params.json
+                TemplatePath: BuildOutput::packaged-template.yaml
+                RoleArn: !Sub arn:aws:iam::${NonProductionAccount}:role/{{resolve:ssm:/CodePipeline/CommonResources/CrossAccountDeployerRoleName:1:1712818823176}}
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+              RoleArn: !Sub "arn:aws:iam::${NonProductionAccount}:role/{{resolve:ssm:/CodePipeline/CommonResources/CrossAccountPipelineRoleName:2:1713407985942}}"
+            - Name: DeployChangeSetDev
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: "1"
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: !Ref RepositoryName
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub ${StackName}-dev
+                RoleArn: !Sub "arn:aws:iam::${NonProductionAccount}:role/{{resolve:ssm:/CodePipeline/CommonResources/CrossAccountDeployerRoleName:1:1712818823176}}"
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 2
+              RoleArn: !Sub "arn:aws:iam::${NonProductionAccount}:role/{{resolve:ssm:/CodePipeline/CommonResources/CrossAccountPipelineRoleName:2:1713407985942}}"
+
+        - Name: ApproveDeployTest
+          Actions:
+            - Name: ApproveDeployTest
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Version: "1"
+                Provider: Manual
+              Configuration:
+                CustomData: "Ensure that the associated Change Request for a deployment to Test is approved."
+        - Name: DeployToTest
+          Actions:
+            - Name: CreateChangeSetTest
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: "1"
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: !Ref RepositoryName
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub ${StackName}-test
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                TemplateConfiguration: BuildOutput::packaged-template-test-params.json
+                TemplatePath: BuildOutput::packaged-template.yaml
+                RoleArn: !Sub "arn:aws:iam::${NonProductionAccount}:role/{{resolve:ssm:/CodePipeline/CommonResources/CrossAccountDeployerRoleName:1:1712818823176}}"
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+              RoleArn: !Sub "arn:aws:iam::${NonProductionAccount}:role/{{resolve:ssm:/CodePipeline/CommonResources/CrossAccountPipelineRoleName:2:1713407985942}}"
+            - Name: DeployChangeSetTest
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: "1"
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: !Ref RepositoryName
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub ${StackName}-test
+                RoleArn: !Sub "arn:aws:iam::${NonProductionAccount}:role/{{resolve:ssm:/CodePipeline/CommonResources/CrossAccountDeployerRoleName:1:1712818823176}}"
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 2
+              RoleArn: !Sub "arn:aws:iam::${NonProductionAccount}:role/{{resolve:ssm:/CodePipeline/CommonResources/CrossAccountPipelineRoleName:2:1713407985942}}"
+        - Name: ApproveDeployProd
+          Actions:
+            - Name: ApproveDeployProd
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Version: "1"
+                Provider: Manual
+              Configuration:
+                CustomData: "Ensure that the associated Change Request for a deployment to Production is approved."
+        - Name: DeployToProduction
+          Actions:
+            - Name: CreateChangeSetProd
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: "1"
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: !Ref RepositoryName
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub ${StackName}-prod
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                TemplateConfiguration: BuildOutput::packaged-template-prod-params.json
+                TemplatePath: BuildOutput::packaged-template.yaml
+                RoleArn: !Sub "arn:aws:iam::${ProductionAccount}:role/{{resolve:ssm:/CodePipeline/CommonResources/CrossAccountDeployerRoleName:1:1712818823176}}"
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+              RoleArn: !Sub "arn:aws:iam::${ProductionAccount}:role/{{resolve:ssm:/CodePipeline/CommonResources/CrossAccountPipelineRoleName:2:1713407985942}}"
+            - Name: DeployChangeSetProd
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: "1"
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: !Ref RepositoryName
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub ${StackName}-prod
+                RoleArn: !Sub "arn:aws:iam::${ProductionAccount}:role/{{resolve:ssm:/CodePipeline/CommonResources/CrossAccountDeployerRoleName:1:1712818823176}}"
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 2
+              RoleArn: !Sub "arn:aws:iam::${ProductionAccount}:role/{{resolve:ssm:/CodePipeline/CommonResources/CrossAccountPipelineRoleName:2:1713407985942}}"
+
+      ArtifactStore:
+        Type: S3
+        Location: "{{resolve:ssm:/CodePipeline/CommonResources/S3Bucket:1:1712818848842}}"
+        EncryptionKey:
+          Id: "{{resolve:ssm:/CodePipeline/CommonResources/CMKARN:2:1713342645825}}"
+          Type: KMS
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline

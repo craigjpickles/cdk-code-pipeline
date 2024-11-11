@@ -122,7 +122,6 @@ Resources:
               - s3:GetBucketPolicy
               - s3:GetObject
               - s3:ListBucket
-
             Resource:
               - !Join ["", ["arn:aws:s3:::", !Ref S3Bucket, "/*"]]
               - !Join ["", ["arn:aws:s3:::", !Ref S3Bucket]]
@@ -139,6 +138,17 @@ Resources:
               - codecommit:CancelUploadArchive
             Resource:
               - "*"
+          - Effect: Allow
+            Action:
+              - cloudformation:Describe*
+              - cloudFormation:List*
+            Resource:
+              - "*"     
+         - Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource:
+              - "*"     
           - Effect: Allow
             Action:
               - codebuild:*
