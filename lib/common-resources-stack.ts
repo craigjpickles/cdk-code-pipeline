@@ -226,11 +226,7 @@ export class CommonResourcesStack extends cdk.Stack {
           }),
           new iam.PolicyStatement({
             effect: iam.Effect.ALLOW,
-            actions: [
-              'cloudformation:Describe*',
-              'cloudformation:List*',
-              'cloudformation:*ChangeSet',
-            ],
+            actions: ['cloudformation:*'],
             resources: ['*'],
           }),
           new iam.PolicyStatement({
