@@ -8,40 +8,17 @@ import * as kms from 'aws-cdk-lib/aws-kms'
 import * as ssm from 'aws-cdk-lib/aws-ssm' // Add this line
 import { Construct } from 'constructs'
 import { LinuxBuildImage } from 'aws-cdk-lib/aws-codebuild'
+import { GitPullRequestEvent } from 'aws-cdk-lib/aws-codepipeline'
 
 export class CIPipelineStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props)
-    
-    const stackName = new cdk.CfnParameter(this, 'StackName', {
-      type: 'String',
-      description: 'lowercase name of stack',
-    })
-
-    const repositoryName = new cdk.CfnParameter(this, 'RepositoryName', {
-      type: 'String',
-      description: 'Name of the Project',
-    })
-
-    const repositoryOwner = new cdk.CfnParameter(this, 'RepositoryOwner', {
-      type: 'String',
-      description: 'Repository Owner',
-    })
 
     const branchName = new cdk.CfnParameter(this, 'BranchName', {
       type: 'String',
       description: 'Name of the branch',
       default: 'main',
     })
-
-    const codeStarConnectionId = new cdk.CfnParameter(
-      this,
-      'CodeStarConnectionId',
-      {
-        type: 'String',
-        description: 'The codestar connection ID',
-      },
-    )
 
     const branchTemplateName = new cdk.CfnParameter(
       this,
@@ -50,6 +27,15 @@ export class CIPipelineStack extends cdk.Stack {
         type: 'String',
         description: 'Name of the CF template',
         default: 'template.yaml',
+      },
+    )
+
+    const codeStarConnectionId = new cdk.CfnParameter(
+      this,
+      'CodeStarConnectionId',
+      {
+        type: 'String',
+        description: 'The codestar connection ID',
       },
     )
 
@@ -69,18 +55,36 @@ export class CIPipelineStack extends cdk.Stack {
       },
     )
 
+    const repositoryName = new cdk.CfnParameter(this, 'RepositoryName', {
+      type: 'String',
+      description: 'Name of the Project',
+    })
+
+    const repositoryOwner = new cdk.CfnParameter(this, 'RepositoryOwner', {
+      type: 'String',
+      description: 'Repository Owner',
+    })
+
+    const stackName = new cdk.CfnParameter(this, 'StackName', {
+      type: 'String',
+      description: 'lowercase name of stack',
+    })
+
     const artifactBucketName = ssm.StringParameter.valueForStringParameter(
       this,
       '/CodePipelineCDK/CommonResources/S3Bucket',
     )
+
     const encryptionKeyArn = ssm.StringParameter.valueForStringParameter(
       this,
       '/CodePipelineCDK/CommonResources/CMKARN',
     )
+
     const pipelineRoleArn = ssm.StringParameter.valueForStringParameter(
       this,
       '/CodePipelineCDK/CommonResources/PipelineRoleARN',
     )
+
     const buildRoleArn = ssm.StringParameter.valueForStringParameter(
       this,
       '/CodePipelineCDK/CommonResources/BuildProjectRoleARN',
@@ -112,6 +116,7 @@ export class CIPipelineStack extends cdk.Stack {
 
     const buildRole = iam.Role.fromRoleArn(this, 'BuildRole', buildRoleArn)
 
+    // build project
     const buildProject = new codebuild.PipelineProject(this, 'BuildProject', {
       description: stackName.valueAsString,
       encryptionKey: encryptionKey,
@@ -134,6 +139,7 @@ export class CIPipelineStack extends cdk.Stack {
       queuedTimeout: cdk.Duration.minutes(10),
     })
 
+    // deploy project
     const deployBuildProject = new codebuild.PipelineProject(
       this,
       'DeployBuildProject',
@@ -157,22 +163,12 @@ export class CIPipelineStack extends cdk.Stack {
                 STACK_NAME="$StackName-dev"
                 BRANCH_NAME=$BranchName
                 echo "The branch name is: $BRANCH_NAME"
-                echo "The branch override is: $BranchOverride"
-                
-                if [ $BranchOverride != 'main' ]; then
-                  BRANCH_NAME=$BranchOverride
-                fi
-                
-                if [ $BRANCH_NAME == 'main' ]; then
-                  echo "Deploying template TemplateName.yaml as stack '$STACK_NAME'"
-                  aws cloudformation deploy --template-file packaged-template.yaml --parameter-overrides file://packaged-template-dev-params.json --stack-name $STACK_NAME --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset
-                else
-                  SANITISED_BRANCH=$(echo $BRANCH_NAME | sed 's/[\/\\]/-/g')
-                  echo "The sanitised branch name is: $SANITISED_BRANCH"
-                  MODIFIED_STACK_NAME=$STACK_NAME-$SANITISED_BRANCH
-                  echo "Deploying template TemplateName.yaml as stack '$MODIFIED_STACK_NAME'"
-                  aws cloudformation deploy --template-file packaged-template.yaml --parameter-overrides file://packaged-template-dev-params.json --stack-name $MODIFIED_STACK_NAME --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset
-                fi
+
+                SANITISED_BRANCH=$(echo $BRANCH_NAME | sed 's/[\/\\]/-/g')
+                echo "The sanitised branch name is: $SANITISED_BRANCH"
+                MODIFIED_STACK_NAME=$STACK_NAME-$SANITISED_BRANCH
+                echo "Deploying template TemplateName.yaml as stack '$MODIFIED_STACK_NAME'"
+                aws cloudformation deploy --template-file packaged-template.yaml --parameter-overrides file://packaged-template-dev-params.json --stack-name $MODIFIED_STACK_NAME --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset
             `,
             },
           },
@@ -186,34 +182,48 @@ export class CIPipelineStack extends cdk.Stack {
       },
     )
 
-    const branchOverrideVariable = new codepipeline.Variable({
-      variableName: 'BranchOverride',
-      description: 'Override for branch name',
-      defaultValue: 'main',
-    })
+    const codeStarConnectionArn = `arn:aws:codestar-connections:ap-southeast-2:${cdk.Aws.ACCOUNT_ID}:connection/${codeStarConnectionId.valueAsString}`
 
+    // source action
+    const sourceAction =
+      new codepipeline_actions.CodeStarConnectionsSourceAction({
+        actionName: 'Source',
+        owner: repositoryOwner.valueAsString,
+        repo: repositoryName.valueAsString,
+        connectionArn: codeStarConnectionArn,
+        output: new codepipeline.Artifact('SourceArtifact'),
+        role: buildRole,
+        runOrder: 1,
+        variablesNamespace: 'SourceVariables',
+      })
+
+    // pipeline triggers
+    const triggerProps: codepipeline.TriggerProps[] = [
+      {
+        providerType: codepipeline.ProviderType.CODE_STAR_SOURCE_CONNECTION,
+        gitConfiguration: {
+          sourceAction: sourceAction,
+          pullRequestFilter: [
+            {
+              branchesIncludes: ['**'],
+              events: [GitPullRequestEvent.OPEN, GitPullRequestEvent.UPDATED],
+            },
+          ],
+        },
+      },
+    ]
+
+    // pipeline definition
     new codepipeline.Pipeline(this, 'Pipeline', {
       pipelineName: 'CodePipelineCDKDemo-CI-Pipeline',
       executionMode: codepipeline.ExecutionMode.PARALLEL,
       role: pipelineRole,
       artifactBucket: artifactBucket,
-      variables: [branchOverrideVariable],
+      triggers: triggerProps,
       stages: [
         {
           stageName: 'Source',
-          actions: [
-            new codepipeline_actions.CodeStarConnectionsSourceAction({
-              actionName: 'App',
-              owner: repositoryOwner.valueAsString,
-              repo: repositoryName.valueAsString,
-              branch: branchName.valueAsString,
-              connectionArn: `arn:aws:codestar-connections:ap-southeast-2:${cdk.Aws.ACCOUNT_ID}:connection/${codeStarConnectionId.valueAsString}`,
-              output: new codepipeline.Artifact('SCCheckoutArtifact'),
-              role: buildRole,
-              runOrder: 1,
-              variablesNamespace: 'SourceVariables',
-            }),
-          ],
+          actions: [sourceAction],
         },
         {
           stageName: 'Build',
@@ -221,7 +231,7 @@ export class CIPipelineStack extends cdk.Stack {
             new codepipeline_actions.CodeBuildAction({
               actionName: 'BuildAndPackage',
               project: buildProject,
-              input: new codepipeline.Artifact('SCCheckoutArtifact'),
+              input: new codepipeline.Artifact('SourceArtifact'),
               outputs: [new codepipeline.Artifact('BuildOutput')],
               role: pipelineRole,
               runOrder: 1,
@@ -240,9 +250,8 @@ export class CIPipelineStack extends cdk.Stack {
               runOrder: 1,
               environmentVariables: {
                 BranchName: {
-                  value: '#{SourceVariables.BranchName}',
+                  value: '#{SourceVariables.SourceBranchName}',
                 },
-                BranchOverride: { value: '#{variables.BranchOverride}'},
                 AccountNumber: { value: nonProductionAccount.valueAsString },
                 RoleArn: { value: crossAccountDeployerRoleName },
                 StackName: { value: stackName.valueAsString },
