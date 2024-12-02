@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib/core'
 import * as codebuild from 'aws-cdk-lib/aws-codebuild'
 import * as codepipeline from 'aws-cdk-lib/aws-codepipeline'
 import {
+  CloudFormationCreateUpdateStackAction,
   CodeBuildAction,
   CodeStarConnectionsSourceAction,
   ManualApprovalAction,
@@ -12,7 +13,7 @@ import * as kms from 'aws-cdk-lib/aws-kms'
 import * as ssm from 'aws-cdk-lib/aws-ssm' // Add this line
 import { Construct } from 'constructs'
 import { LinuxBuildImage } from 'aws-cdk-lib/aws-codebuild'
-import { Environment } from 'aws-cdk-lib/aws-appconfig'
+import * as uuid from 'uuid'
 
 export class CDPipelineStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -236,26 +237,48 @@ export class CDPipelineStack extends cdk.Stack {
       ],
     })
 
+    const crossAccountDevDeployerRole = iam.Role.fromRoleArn(
+      this,
+      'CrossAccountDevDeployerRole',
+      `arn:aws:iam::${nonProductionAccount.valueAsString}:role/${crossAccountDeployerRoleName}`,
+      {
+        // Ensure the role can be assumed by the pipeline
+        mutable: false,
+      },
+    )
+
+    const crossAccountDevPipelineRole = iam.Role.fromRoleArn(
+      this,
+      'CrossAccountDevPipelineRole',
+      `arn:aws:iam::${nonProductionAccount.valueAsString}:role/${crossAccountPipelineRoleName}`,
+      {
+        // Ensure the role can be assumed by the pipeline
+        mutable: false,
+      },
+    )
+
     // Dev Stage
     pipeline.addStage({
       stageName: 'DeployDev',
       actions: [
-        new CodeBuildAction({
-          actionName: 'Deploy',
-          project: deployBuildProject,
-          input: new codepipeline.Artifact('BuildOutput'),
-          outputs: [new codepipeline.Artifact('DeployDevOutput')],
-          role: pipelineRole,
+        new CloudFormationCreateUpdateStackAction({
+          actionName: 'CreateUpdateStackDev',
+          stackName: `${stackName.valueAsString}-dev`,
+          templatePath: new codepipeline.Artifact('BuildOutput').atPath(
+            'packaged-template.yaml',
+          ),
+          adminPermissions: true,
+          account: nonProductionAccount.valueAsString,
+          cfnCapabilities: [
+            cdk.CfnCapabilities.NAMED_IAM,
+            cdk.CfnCapabilities.AUTO_EXPAND,
+          ],
+          deploymentRole: crossAccountDevDeployerRole,
+          role: crossAccountDevPipelineRole,
           runOrder: 1,
-          environmentVariables: {
-            BranchName: {
-              value: '#{SourceVariables.BranchName}',
-            },
-            AccountNumber: { value: nonProductionAccount.valueAsString },
-            RoleArn: { value: crossAccountDeployerRoleName },
-            StackName: { value: stackName.valueAsString },
-            Environment: { value: 'dev' },
-          },
+          templateConfiguration: new codepipeline.Artifact(
+            'BuildOutput',
+          ).atPath('packaged-template-dev-params.json'),
         }),
       ],
     })
@@ -276,26 +299,49 @@ export class CDPipelineStack extends cdk.Stack {
       }),
     )
 
+
+    const crossAccountProdDeployerRole = iam.Role.fromRoleArn(
+      this,
+      'CrossAccountProdDeployerRole',
+      `arn:aws:iam::${productionAccount.valueAsString}:role/${crossAccountDeployerRoleName}`,
+      {
+        // Ensure the role can be assumed by the pipeline
+        mutable: false,
+      },
+    )
+
+    const crossAccountProdPipelineRole = iam.Role.fromRoleArn(
+      this,
+      'CrossAccountProdPipelineRole',
+      `arn:aws:iam::${productionAccount.valueAsString}:role/${crossAccountPipelineRoleName}`,
+      {
+        // Ensure the role can be assumed by the pipeline
+        mutable: false,
+      },
+    )
+
     // Prod Stage
     pipeline.addStage({
       stageName: 'DeployProd',
       actions: [
-        new CodeBuildAction({
-          actionName: 'Deploy',
-          project: deployBuildProject,
-          input: new codepipeline.Artifact('BuildOutput'),
-          outputs: [new codepipeline.Artifact('DeployProdOutput')],
-          role: pipelineRole,
+        new CloudFormationCreateUpdateStackAction({
+          actionName: 'CreateUpdateStackProd',
+          stackName: `${stackName.valueAsString}-prod`,
+          templatePath: new codepipeline.Artifact('BuildOutput').atPath(
+            'packaged-template.yaml',
+          ),
+          adminPermissions: true,
+          account: productionAccount.valueAsString,
+          cfnCapabilities: [
+            cdk.CfnCapabilities.NAMED_IAM,
+            cdk.CfnCapabilities.AUTO_EXPAND,
+          ],
+          deploymentRole: crossAccountProdDeployerRole,
+          role: crossAccountProdPipelineRole,
           runOrder: 1,
-          environmentVariables: {
-            BranchName: {
-              value: '#{SourceVariables.BranchName}',
-            },
-            AccountNumber: { value: productionAccount.valueAsString },
-            RoleArn: { value: crossAccountDeployerRoleName },
-            StackName: { value: stackName.valueAsString },
-            Environment: { value: 'prod' },
-          },
+          templateConfiguration: new codepipeline.Artifact(
+            'BuildOutput',
+          ).atPath('packaged-template-prod-params.json'),
         }),
       ],
     })
