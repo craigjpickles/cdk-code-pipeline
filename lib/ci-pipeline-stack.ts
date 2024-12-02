@@ -2,7 +2,10 @@ import * as cdk from 'aws-cdk-lib/core'
 import * as codebuild from 'aws-cdk-lib/aws-codebuild'
 import * as codepipeline from 'aws-cdk-lib/aws-codepipeline'
 import * as codepipeline_actions from 'aws-cdk-lib/aws-codepipeline-actions'
+import * as events from 'aws-cdk-lib/aws-events'
+import * as events_targets from 'aws-cdk-lib/aws-events-targets'
 import * as iam from 'aws-cdk-lib/aws-iam'
+import * as lambda from 'aws-cdk-lib/aws-lambda'
 import * as s3 from 'aws-cdk-lib/aws-s3'
 import * as kms from 'aws-cdk-lib/aws-kms'
 import * as ssm from 'aws-cdk-lib/aws-ssm' // Add this line
@@ -214,7 +217,7 @@ export class CIPipelineStack extends cdk.Stack {
     ]
 
     // pipeline definition
-    new codepipeline.Pipeline(this, 'Pipeline', {
+    const pipeline = new codepipeline.Pipeline(this, 'Pipeline', {
       pipelineName: 'CodePipelineCDKDemo-CI-Pipeline',
       executionMode: codepipeline.ExecutionMode.PARALLEL,
       role: pipelineRole,
@@ -261,5 +264,156 @@ export class CIPipelineStack extends cdk.Stack {
         },
       ],
     })
+
+    // Create a Lambda function to handle the event
+    const pipelineStatusLambda = new lambda.Function(
+      this,
+      'PipelineStatusLambda',
+      {
+        runtime: lambda.Runtime.NODEJS_20_X,
+        handler: 'index.handler',
+        code: lambda.Code.fromInline(`
+          const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+          const { CodePipelineClient, GetPipelineExecutionCommand } = require('@aws-sdk/client-codepipeline');
+          const https = require('https');
+  
+          const secretsManagerClient = new SecretsManagerClient({});
+          const codePipelineClient = new CodePipelineClient({});
+  
+          exports.handler = async (event) => {
+            try {
+              console.log('Event:', JSON.stringify(event));
+    
+              const pipelineName = event.detail.pipeline;
+              const executionId = event.detail['execution-id'];
+              const state = event.detail.state;
+    
+              // PR request ID
+              const executionTrigger = event.detail['execution-trigger'];
+              const triggerDetail = JSON.parse(executionTrigger['trigger-detail']);
+              const pullRequestId = triggerDetail.pullRequestId;
+
+              const params = {
+                pipelineName,
+                pipelineExecutionId: executionId,
+              };
+      
+              const command = new GetPipelineExecutionCommand(params);
+              const data = await codePipelineClient.send(command);
+    
+              const executionStatus = data.pipelineExecution.status;
+           
+              const getSecretCommand = new GetSecretValueCommand({
+                SecretId: process.env.GITHUB_TOKEN_SECRET_NAME,
+              });
+              const secretValue = await secretsManagerClient.send(getSecretCommand);
+
+              const githubToken = JSON.parse(secretValue.SecretString).token;
+
+              const options = {
+                hostname: 'api.github.com',
+                path: \`/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/issues/\${pullRequestId}/comments\`,
+                method: 'POST',
+                headers: {
+                  'Accept': 'application/vnd.github+json',
+                  'Authorization': \`Bearer \${githubToken}\`,
+                  'User-Agent': 'AWS Lambda',
+                  'Content-Type': 'application/json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                },
+              };
+    
+              const commentBody = JSON.stringify({
+                  body: \`CodePipeline Execution Update:
+                  - Pipeline: \${pipelineName}
+                  - Execution ID: \${executionId}
+                  - Status: \${executionStatus}\`
+              });
+
+              await new Promise((resolve, reject) => {
+                const req = https.request(options, (res) => {
+                  let responseBody = '';
+
+                  res.on('data', (chunk) => {
+                    responseBody += chunk;
+                  });
+
+                  res.on('end', () => {
+                    if (res.statusCode >= 200 && res.statusCode < 300) {
+                      resolve(responseBody);
+                    } else {
+                      reject(new Error(\`GitHub API responded with status \${res.statusCode}: \${responseBody}\`));
+                    }
+                  });
+                });
+
+                req.on('error', (error) => {
+                  reject(error);
+                });
+
+                req.write(commentBody);
+                req.end();
+              });
+
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ 
+                  message: 'GitHub PR comment added successfully',
+                  pipelineDetails: { pipelineName, executionId, executionStatus }
+                })
+              };
+            } catch (error) {
+              console.error('Error processing CodePipeline event:', error);
+            
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ 
+                  message: 'Failed to add GitHub PR comment',
+                  error: error.message 
+                })
+              };
+            }
+          }
+        `),
+        environment: {
+          GITHUB_TOKEN_SECRET_NAME: '/CodePipeline/GitHubToken',
+          REPO_NAME: repositoryName.valueAsString,
+          REPO_OWNER: repositoryOwner.valueAsString,
+        },
+      },
+    )
+
+    // Grant the Lambda function permissions to read the pipeline status
+    pipelineStatusLambda.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['codepipeline:GetPipelineExecution'],
+        resources: ['*'],
+      }),
+    )
+
+    // secrets manager permissions
+    pipelineStatusLambda.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [
+          `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:*`,
+        ],
+      }),
+    )
+
+    // Create an EventBridge rule to detect pipeline state changes
+    const rule = new events.Rule(this, 'PipelineStateChangeRule', {
+      eventPattern: {
+        source: ['aws.codepipeline'],
+        detailType: ['CodePipeline Pipeline Execution State Change'],
+        detail: {
+          pipeline: [pipeline.pipelineName],
+          state: ['STARTED', 'SUCCEEDED', 'FAILED'],
+        },
+      },
+    })
+
+    // Add the Lambda function as the target of the rule
+    rule.addTarget(new events_targets.LambdaFunction(pipelineStatusLambda))
   }
 }
