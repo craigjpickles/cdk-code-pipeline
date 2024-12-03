@@ -280,6 +280,114 @@ export class CIPipelineStack extends cdk.Stack {
           const secretsManagerClient = new SecretsManagerClient({});
           const codePipelineClient = new CodePipelineClient({});
   
+          const updateComments = async (pipelineName, executionId, executionStatus, pullRequestId, githubToken) => {
+            const options = {
+              hostname: 'api.github.com',
+              path: \`/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/issues/\${pullRequestId}/comments\`,
+              method: 'POST',
+              headers: {
+                'Accept': 'application/vnd.github+json',
+                'Authorization': \`Bearer \${githubToken}\`,
+                'User-Agent': 'AWS Lambda',
+                'Content-Type': 'application/json',
+                'X-GitHub-Api-Version': '2022-11-28',
+              },
+            };
+  
+            const commentBody = JSON.stringify({
+                body: \`CodePipeline Execution Update:
+                - Pipeline: \${pipelineName}
+                - Execution ID: \${executionId}
+                - Status: \${executionStatus}\`
+            });
+
+            await new Promise((resolve, reject) => {
+              const req = https.request(options, (res) => {
+                let responseBody = '';
+
+                res.on('data', (chunk) => {
+                  responseBody += chunk;
+                });
+
+                res.on('end', () => {
+                  if (res.statusCode >= 200 && res.statusCode < 300) {
+                    resolve(responseBody);
+                  } else {
+                    reject(new Error(\`GitHub API responded with status \${res.statusCode}: \${responseBody}\`));
+                  }
+                });
+              });
+
+              req.on('error', (error) => {
+                reject(error);
+              });
+
+              req.write(commentBody);
+              req.end();
+            });
+          }
+         
+          const addReview = async (pipelineName, executionId, executionStatus, pullRequestId, githubToken, commitId) => {
+            const reviewOptions = {
+              hostname: 'api.github.com',
+              path: \`/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/pulls/\${pullRequestId}/reviews\`,
+              method: 'POST',
+              headers: {
+                'Accept': 'application/vnd.github+json',
+                'Authorization': \`Bearer \${githubToken}\`,
+                'User-Agent': 'AWS Lambda',
+                'Content-Type': 'application/json',
+                'X-GitHub-Api-Version': '2022-11-28',
+              },
+            };
+  
+            const reviewBody = JSON.stringify({
+                commit_id: \`\${commitId}\`,
+                body: 'Approved by CodePipeline', 
+                event: 'APPROVE',
+                comments: [
+                  {
+                    path:'README.md',
+                    position:1,
+                    body:'CI job failed.'
+                  }
+                ]
+            });
+
+            await new Promise((resolve, reject) => {
+              const req = https.request(reviewOptions, (res) => {
+                let responseBody = '';
+
+                res.on('data', (chunk) => {
+                  responseBody += chunk;
+                });
+
+                res.on('end', () => {
+                  if (res.statusCode >= 200 && res.statusCode < 300) {
+                    resolve(responseBody);
+                  } else {
+                    reject(new Error(\`GitHub API responded with status \${res.statusCode}: \${responseBody}\`));
+                  }
+                });
+              });
+
+              req.on('error', (error) => {
+                reject(error);
+              });
+
+              req.write(reviewBody);
+              req.end();
+            });
+
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ 
+                message: 'GitHub PR updated successfully',
+                pipelineDetails: { pipelineName, executionId, executionStatus }
+              })
+            };
+          }
+
           exports.handler = async (event) => {
             try {
               console.log('Event:', JSON.stringify(event));
@@ -287,12 +395,8 @@ export class CIPipelineStack extends cdk.Stack {
               const pipelineName = event.detail.pipeline;
               const executionId = event.detail['execution-id'];
               const state = event.detail.state;
-    
-              // PR request ID
               const executionTrigger = event.detail['execution-trigger'];
-              const triggerDetail = JSON.parse(executionTrigger['trigger-detail']);
-              const pullRequestId = triggerDetail.pullRequestId;
-
+              
               const params = {
                 pipelineName,
                 pipelineExecutionId: executionId,
@@ -300,8 +404,13 @@ export class CIPipelineStack extends cdk.Stack {
       
               const command = new GetPipelineExecutionCommand(params);
               const data = await codePipelineClient.send(command);
-    
+              console.log('Pipeline execution:', JSON.stringify(data));
+
               const executionStatus = data.pipelineExecution.status;
+
+              const triggerDetail = JSON.parse(data.pipelineExecution.trigger.triggerDetail);
+              const pullRequestId = triggerDetail.pullRequestId;
+              const commitId = data.pipelineExecution.artifactRevisions[0].revisionId;
            
               const getSecretCommand = new GetSecretValueCommand({
                 SecretId: process.env.GITHUB_TOKEN_SECRET_NAME,
@@ -310,58 +419,18 @@ export class CIPipelineStack extends cdk.Stack {
 
               const githubToken = JSON.parse(secretValue.SecretString).token;
 
-              const options = {
-                hostname: 'api.github.com',
-                path: \`/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/issues/\${pullRequestId}/comments\`,
-                method: 'POST',
-                headers: {
-                  'Accept': 'application/vnd.github+json',
-                  'Authorization': \`Bearer \${githubToken}\`,
-                  'User-Agent': 'AWS Lambda',
-                  'Content-Type': 'application/json',
-                  'X-GitHub-Api-Version': '2022-11-28',
-                },
-              };
-    
-              const commentBody = JSON.stringify({
-                  body: \`CodePipeline Execution Update:
-                  - Pipeline: \${pipelineName}
-                  - Execution ID: \${executionId}
-                  - Status: \${executionStatus}\`
-              });
+              await updateComments(pipelineName, executionId, executionStatus, pullRequestId, githubToken);  
 
-              await new Promise((resolve, reject) => {
-                const req = https.request(options, (res) => {
-                  let responseBody = '';
-
-                  res.on('data', (chunk) => {
-                    responseBody += chunk;
-                  });
-
-                  res.on('end', () => {
-                    if (res.statusCode >= 200 && res.statusCode < 300) {
-                      resolve(responseBody);
-                    } else {
-                      reject(new Error(\`GitHub API responded with status \${res.statusCode}: \${responseBody}\`));
-                    }
-                  });
-                });
-
-                req.on('error', (error) => {
-                  reject(error);
-                });
-
-                req.write(commentBody);
-                req.end();
-              });
-
-              return {
-                statusCode: 200,
-                body: JSON.stringify({ 
-                  message: 'GitHub PR comment added successfully',
-                  pipelineDetails: { pipelineName, executionId, executionStatus }
-                })
-              };
+              switch (state) {
+                case 'SUCCEEDED':
+                  addReview(pipelineName, executionId, executionStatus, pullRequestId, githubToken, commitId);
+                  break;
+                case 'STARTED':
+                  // Add your code here for handling Manual trigger
+                  break;
+                default:
+                  break;
+              }
             } catch (error) {
               console.error('Error processing CodePipeline event:', error);
             
