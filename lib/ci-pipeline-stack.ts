@@ -281,6 +281,7 @@ export class CIPipelineStack extends cdk.Stack {
           const codePipelineClient = new CodePipelineClient({});
   
           const updateComments = async (pipelineName, executionId, executionStatus, pullRequestId, githubToken) => {
+            console.log('Updating comments');
             const options = {
               hostname: 'api.github.com',
               path: \`/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/issues/\${pullRequestId}/comments\`,
@@ -327,7 +328,8 @@ export class CIPipelineStack extends cdk.Stack {
             });
           }
          
-          const addReview = async (pipelineName, executionId, executionStatus, pullRequestId, githubToken, commitId) => {
+          const addReview = async (pipelineName, executionId, executionStatus, pullRequestId, githubToken, commitId, approved) => {
+            console.log('Adding review:', approved);
             const reviewOptions = {
               hostname: 'api.github.com',
               path: \`/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/pulls/\${pullRequestId}/reviews\`,
@@ -340,18 +342,11 @@ export class CIPipelineStack extends cdk.Stack {
                 'X-GitHub-Api-Version': '2022-11-28',
               },
             };
-  
+
             const reviewBody = JSON.stringify({
                 commit_id: \`\${commitId}\`,
-                body: 'Approved by CodePipeline', 
-                event: 'APPROVE',
-                comments: [
-                  {
-                    path:'README.md',
-                    position:1,
-                    body:'CI job failed.'
-                  }
-                ]
+                body: 'CodePipeline approval process', 
+                event: approved ? 'APPROVE' : 'REQUEST_CHANGES',
             });
 
             await new Promise((resolve, reject) => {
@@ -388,6 +383,111 @@ export class CIPipelineStack extends cdk.Stack {
             };
           }
 
+          const getCommits = async (pipelineName, executionId, executionStatus, pullRequestId, githubToken) => {
+              console.log('Retrieving commits');
+              const options = {
+                hostname: 'api.github.com',
+                path: \`/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/pulls/\${pullRequestId}/commits\`,
+                method: 'GET',
+                headers: {
+                  'Accept': 'application/vnd.github+json',
+                  'Authorization': \`Bearer \${githubToken}\`,
+                  'User-Agent': 'AWS Lambda',
+                  'Content-Type': 'application/json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                },
+              };
+
+              const responseBody = await new Promise((resolve, reject) => {
+              const req = https.request(options, (res) => {
+                let data = '';
+
+                res.on('data', (chunk) => {
+                  data += chunk;
+                });
+
+                res.on('end', () => {
+                  if (res.statusCode >= 200 && res.statusCode < 300) {
+                    resolve(data);
+                  } else {
+                    reject(new Error(\`GitHub API responded with status \${res.statusCode}: \${data}\`));
+                  }
+                });
+              });
+
+              req.on('error', (error) => {
+                reject(error);
+              });
+
+              req.end();
+            });
+
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ 
+                message: 'GitHub PR commits retrieved successfully',
+                pipelineDetails: { pipelineName, executionId, executionStatus },
+                commits: JSON.parse(responseBody)
+              })
+            };
+          }
+
+          const addStatus = async (pipelineName, executionId, executionStatus, githubToken, commitId, state) => {
+            console.log('Adding status:', state);
+            const statusOptions = {
+              hostname: 'api.github.com',
+              path: \`/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/statuses/\${commitId}\`,
+              method: 'POST',
+              headers: {
+                'Accept': 'application/vnd.github+json',
+                'Authorization': \`Bearer \${githubToken}\`,
+                'User-Agent': 'AWS Lambda',
+                'Content-Type': 'application/json',
+                'X-GitHub-Api-Version': '2022-11-28',
+              },
+            };
+  
+            const statusBody = JSON.stringify({
+                state: \`\${state}\`,
+                target_url: \`https://console.aws.amazon.com/codesuite/codepipeline/pipelines/\${pipelineName}/executions/\${executionId}/timeline\`, 
+                description: \`CodePipeline build is marked as \${state}\`,
+                context: "continuous-integration/codepipeline"
+            });
+
+            await new Promise((resolve, reject) => {
+              const req = https.request(statusOptions, (res) => {
+                let responseBody = '';
+
+                res.on('data', (chunk) => {
+                  responseBody += chunk;
+                });
+
+                res.on('end', () => {
+                  if (res.statusCode >= 200 && res.statusCode < 300) {
+                    resolve(responseBody);
+                  } else {
+                    reject(new Error(\`GitHub API responded with status \${res.statusCode}: \${responseBody}\`));
+                  }
+                });
+              });
+
+              req.on('error', (error) => {
+                reject(error);
+              });
+
+              req.write(statusBody);
+              req.end();
+            });
+
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ 
+                message: 'GitHub PR updated successfully',
+                pipelineDetails: { pipelineName, executionId, executionStatus }
+              })
+            };
+          }
+
           exports.handler = async (event) => {
             try {
               console.log('Event:', JSON.stringify(event));
@@ -410,8 +510,10 @@ export class CIPipelineStack extends cdk.Stack {
 
               const triggerDetail = JSON.parse(data.pipelineExecution.trigger.triggerDetail);
               const pullRequestId = triggerDetail.pullRequestId;
-              const commitId = data.pipelineExecution.artifactRevisions[0].revisionId;
-           
+
+              const commitId = data.pipelineExecution.artifactRevisions?.length > 0 ? data.pipelineExecution.artifactRevisions[0].revisionId : undefined;
+              const revisionIds = data.pipelineExecution.artifactRevisions?.length > 0 ? data.pipelineExecution.artifactRevisions.map(revision => revision.revisionId) : undefined;
+
               const getSecretCommand = new GetSecretValueCommand({
                 SecretId: process.env.GITHUB_TOKEN_SECRET_NAME,
               });
@@ -421,14 +523,41 @@ export class CIPipelineStack extends cdk.Stack {
 
               await updateComments(pipelineName, executionId, executionStatus, pullRequestId, githubToken);  
 
+
               switch (state) {
-                case 'SUCCEEDED':
-                  addReview(pipelineName, executionId, executionStatus, pullRequestId, githubToken, commitId);
+                case 'SUCCEEDED':    
+                  await addReview(pipelineName, executionId, executionStatus, pullRequestId, githubToken, commitId, true);
+                  for (const revisionId of revisionIds) {
+                   await addStatus(pipelineName, executionId, executionStatus, githubToken, revisionId, 'success');
+                  }
+                  
                   break;
                 case 'STARTED':
-                  // Add your code here for handling Manual trigger
+                case 'SUPERSEDED':  
+                case 'RESUMED':
+                  // update checks for all revisions
+                  if (revisionIds) {
+                    for (const revisionId of revisionIds) {
+                      await addStatus(pipelineName, executionId, executionStatus, githubToken, revisionId, 'pending');
+                    }
+                  } else { 
+                     const response = await getCommits(pipelineName, executionId, executionStatus, pullRequestId, githubToken);
+                     console.log('Commits: ', JSON.stringify(response));
+                     for (const commit of response.body.commits) {
+                      await addStatus(pipelineName, executionId, executionStatus, githubToken, commit.sha, 'pending');
+                    }
+                  }
+                  break;
+                case 'FAILED':
+                case 'STOPPED':
+                case 'CANCELED':  
+                  for (const revisionId of revisionIds) {
+                   await addStatus(pipelineName, executionId, executionStatus, githubToken, revisionId, 'failure');
+                  }
+                  await addReview(pipelineName, executionId, executionStatus, pullRequestId, githubToken, commitId, false);
                   break;
                 default:
+                  console.log('No action taken');
                   break;
               }
             } catch (error) {
