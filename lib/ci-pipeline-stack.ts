@@ -272,6 +272,7 @@ export class CIPipelineStack extends cdk.Stack {
       {
         runtime: lambda.Runtime.NODEJS_20_X,
         handler: 'index.handler',
+        timeout: cdk.Duration.seconds(30),
         code: lambda.Code.fromInline(`
           const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
           const { CodePipelineClient, GetPipelineExecutionCommand } = require('@aws-sdk/client-codepipeline');
@@ -379,6 +380,183 @@ export class CIPipelineStack extends cdk.Stack {
               body: JSON.stringify({ 
                 message: 'GitHub PR updated successfully',
                 pipelineDetails: { pipelineName, executionId, executionStatus }
+              })
+            };
+          }
+
+          const addDeployment = async (pipelineName, executionId, executionStatus, pullRequestId, githubToken, commitId, state) => {
+            console.log('Creating deployment with state:', state);
+              
+            // First create the deployment
+            const deploymentOptions = {
+              hostname: 'api.github.com',
+              path: \`/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/deployments\`,
+              method: 'POST',
+              headers: {
+                'Accept': 'application/vnd.github+json',
+                'Authorization': \`Bearer \${githubToken}\`,
+                'User-Agent': 'AWS Lambda',
+                'Content-Type': 'application/json',
+                'X-GitHub-Api-Version': '2022-11-28',
+              },
+            };
+
+            const deploymentBody = JSON.stringify({
+              ref: commitId,
+              environment: 'development',
+              description: \`CodePipeline deployment from \${pipelineName}\`,
+              auto_merge: false,
+              required_contexts: []
+            });
+
+            const deploymentResponse = await new Promise((resolve, reject) => {
+              const req = https.request(deploymentOptions, (res) => {
+                let responseBody = '';
+
+                res.on('data', (chunk) => {
+                  responseBody += chunk;
+                });
+
+                res.on('end', () => {
+                  if (res.statusCode >= 200 && res.statusCode < 300) {
+                    try {
+                      resolve(JSON.parse(responseBody));
+                    } catch (e) {
+                      reject(new Error(\`Failed to parse response: \${responseBody}\`));
+                    }
+                  } else {
+                    reject(new Error(\`GitHub API responded with status \${res.statusCode}: \${responseBody}\`));
+                  }
+                });
+              });
+
+              req.on('error', (error) => {
+                reject(error);
+              });
+
+              req.write(deploymentBody);
+              req.end();
+            });
+            
+            console.log('Deployment created:', JSON.stringify(deploymentResponse));
+            
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ 
+                message: 'GitHub deployment created and updated successfully',
+                pipelineDetails: { pipelineName, executionId, executionStatus },
+                deployment: deploymentResponse
+              })
+            };
+          }
+
+          const addDeploymentStatus = async (pipelineName, executionId, executionStatus, pullRequestId, githubToken, commitId, state) => {
+            console.log('Updating deployment status with state:', state);
+              
+            const listDeploymentOptions = {
+              hostname: 'api.github.com',
+              path: \`/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/deployments?environment=development&per_page=1\`,
+              method: 'GET',
+              headers: {
+                'Accept': 'application/vnd.github+json',
+                'Authorization': \`Bearer \${githubToken}\`,
+                'User-Agent': 'AWS Lambda',
+                'Content-Type': 'application/json',
+                'X-GitHub-Api-Version': '2022-11-28',
+              },
+            };
+            
+            const deploymentResponse = await new Promise((resolve, reject) => {
+              const req = https.request(listDeploymentOptions, (res) => {
+                let responseBody = '';
+
+                res.on('data', (chunk) => {
+                  responseBody += chunk;
+                });
+
+                res.on('end', () => {
+                  if (res.statusCode >= 200 && res.statusCode < 300) {
+                    try {
+                      resolve(JSON.parse(responseBody));
+                    } catch (e) {
+                      reject(new Error(\`Failed to parse deployments response: \${responseBody}\`));
+                    }
+                  } else {
+                    reject(new Error(\`GitHub API responded with status \${res.statusCode}: \${responseBody}\`));
+                  }
+                });
+              });
+
+              req.on('error', (error) => {
+                reject(error);
+              });
+
+              req.end();
+            });
+            
+            console.log('Deployment response:', JSON.stringify(deploymentResponse));
+            const deploymentId = deploymentResponse[0].id;
+            console.log('DeploymentID:', deploymentId);
+
+            const statusOptions = {
+              hostname: 'api.github.com',
+              path: \`/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/deployments/\${deploymentId}/statuses\`,
+              method: 'POST',
+              headers: {
+                'Accept': 'application/vnd.github+json',
+                'Authorization': \`Bearer \${githubToken}\`,
+                'User-Agent': 'AWS Lambda',
+                'Content-Type': 'application/json',
+                'X-GitHub-Api-Version': '2022-11-28',
+              },
+            };
+            
+            const statusBody = JSON.stringify({
+              state: state, // 'success', 'error', 'failure', 'inactive', 'in_progress'
+              log_url: \`https://console.aws.amazon.com/codesuite/codepipeline/pipelines/\${pipelineName}/executions/\${executionId}/timeline\`,
+              description: \`Deployment \${state} for execution \${executionId}\`,
+              environment: 'dev',
+              environment_url: \`https://console.aws.amazon.com/codesuite/codepipeline/pipelines/\${pipelineName}/executions/\${executionId}/timeline\`
+            });
+            
+            const statusResponse = await new Promise((resolve, reject) => {
+              const req = https.request(statusOptions, (res) => {
+                let responseBody = '';
+
+                res.on('data', (chunk) => {
+                  responseBody += chunk;
+                });
+
+                res.on('end', () => {
+                  if (res.statusCode >= 200 && res.statusCode < 300) {
+                    try {
+                      resolve(JSON.parse(responseBody));
+                    } catch (e) {
+                      reject(new Error(\`Failed to parse status response: \${responseBody}\`));
+                    }
+                  } else {
+                    reject(new Error(\`GitHub API responded with status \${res.statusCode}: \${responseBody}\`));
+                  }
+                });
+              });
+
+              req.on('error', (error) => {
+                reject(error);
+              });
+
+              req.write(statusBody);
+              req.end();
+            });
+            
+            console.log('Deployment status updated:', JSON.stringify(statusResponse));
+            
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ 
+                message: 'GitHub deployment created and updated successfully',
+                pipelineDetails: { pipelineName, executionId, executionStatus },
+                deployment: deploymentResponse,
+                status: statusResponse
               })
             };
           }
@@ -530,7 +708,7 @@ export class CIPipelineStack extends cdk.Stack {
                   for (const revisionId of revisionIds) {
                    await addStatus(pipelineName, executionId, executionStatus, githubToken, revisionId, 'success');
                   }
-                  
+                  await addDeploymentStatus(pipelineName, executionId, executionStatus, pullRequestId, githubToken, commitId, 'success');
                   break;
                 case 'STARTED':
                 case 'SUPERSEDED':  
@@ -547,6 +725,7 @@ export class CIPipelineStack extends cdk.Stack {
                       await addStatus(pipelineName, executionId, executionStatus, githubToken, commit.sha, 'pending');
                     }
                   }
+                  await addDeployment(pipelineName, executionId, executionStatus, pullRequestId, githubToken, commitId, 'pending');
                   break;
                 case 'FAILED':
                 case 'STOPPED':
@@ -555,6 +734,7 @@ export class CIPipelineStack extends cdk.Stack {
                    await addStatus(pipelineName, executionId, executionStatus, githubToken, revisionId, 'failure');
                   }
                   await addReview(pipelineName, executionId, executionStatus, pullRequestId, githubToken, commitId, false);
+                  await addDeploymentStatus(pipelineName, executionId, executionStatus, pullRequestId, githubToken, commitId, 'failure');
                   break;
                 default:
                   console.log('No action taken');
